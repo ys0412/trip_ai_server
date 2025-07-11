@@ -1,7 +1,10 @@
 package net.eson.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import net.eson.config.RabbitMQConfig;
 import net.eson.dto.PlanRequest;
+import net.eson.dto.PlanResponse;
 import net.eson.dto.PlanTaskMessage;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -24,15 +27,23 @@ public class AiPlanService {
     @Autowired
     private RedisTemplate<String, Object> redisTemplate;
 
+    @Autowired
+    ObjectMapper objectMapper;
+
     private static final String TASK_PREFIX = "task:";
 
     public String enqueueTask(PlanRequest request) {
         String taskId = UUID.randomUUID().toString();
 
         PlanTaskMessage msg = new PlanTaskMessage();
-        msg.setTaskId(taskId);
+        msg.setDestinations(request.getDestinations());
+        msg.setMultiCityMode(request.isMultiCityMode());
+        msg.setDestination(request.getDestination());
+        msg.setNeedExactDate(request.isNeedExactDate());
+        msg.setSelectedSeason(request.getSelectedSeason());
         msg.setDays(request.getDays());
         msg.setPreferences(request.getPreferences());
+        msg.setTaskId(taskId);
 
         rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE_NAME,
                 RabbitMQConfig.ROUTING_KEY,
@@ -43,12 +54,13 @@ public class AiPlanService {
         return taskId;
     }
 
-    public String getPlanResult(String taskId) {
-        Object value = redisTemplate.opsForValue().get(TASK_PREFIX + taskId);
-        if (value == null || value.toString().isEmpty()) {
+    public String getPlanResult(String taskId) throws JsonProcessingException {
+        String json = (String) redisTemplate.opsForValue().get("task:" + taskId);
+        if (json == null || json.isEmpty()) {
             return null; // 处理中
         }
-        return value.toString();
+        PlanResponse res = objectMapper.readValue(json, PlanResponse.class);
+        return res.toString();
     }
 
 }

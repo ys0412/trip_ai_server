@@ -11,12 +11,12 @@ import org.springframework.context.annotation.Configuration;
  */
 @Configuration
 public class OpenAiConfig {
-    @Value("${openai.api-key}")
+//    @Value("${openai.api-key}")
     private String apiKey;
 
-    @Bean
-    public OpenAiService openAiService() {
-        return new OpenAiService(apiKey);
-    }
+//    @Bean
+//    public OpenAiService openAiService() {
+//        return new OpenAiService(apiKey);
+//    }
 }
     

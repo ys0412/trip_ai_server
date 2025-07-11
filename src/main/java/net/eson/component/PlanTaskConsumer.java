@@ -1,11 +1,14 @@
 package net.eson.component;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.theokanning.openai.completion.CompletionRequest;
 import com.theokanning.openai.service.OpenAiService;
 import lombok.extern.slf4j.Slf4j;
 import net.eson.config.RabbitMQConfig;
 import net.eson.dto.PlanResponse;
 import net.eson.dto.PlanTaskMessage;
+import okio.BufferedSource;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.RedisTemplate;
@@ -29,52 +32,76 @@ public class PlanTaskConsumer {
     @Autowired
     private RedisTemplate<String, Object> redisTemplate;
 
+//    @Autowired
+//    private OpenAiService openAiService;
+
     @Autowired
-    private OpenAiService openAiService;
+    private QwenApiClient qwenApiClient;
+
+    @Autowired
+    ObjectMapper objectMapper;
 
 
     @RabbitListener(queues = RabbitMQConfig.QUEUE_NAME)
-    public void receive(PlanTaskMessage message) {
-        log.info("收到AI行程任务：{}", message);
+    public void receiveStream(PlanTaskMessage msg) {
+        log.info("收到AI行程任务：{}", msg);
+        String taskId = msg.getTaskId();
+        String channel = "plan-delta:" + taskId;   // SSE/WebSocket 订阅的主题
+        StringBuilder full = new StringBuilder();  // 累积完整文本
 
         try {
-            String resultText = generatePlanWithOpenAI(message);
-            PlanResponse response = buildResponse(message.getTaskId(), message, resultText);
+            // 开启流调用，返回 BufferedSource
+            BufferedSource source = qwenApiClient.callQwenStream(buildPrompt(msg));
 
-            redisTemplate.opsForValue().set(
-                    TASK_PREFIX + message.getTaskId(),
-                    response,
-                    30, TimeUnit.MINUTES
-            );
+            while (!source.exhausted()) {
+                String line = source.readUtf8Line();
+                if (line == null) break; // 流结束
+                if (line.isBlank()) continue;
+                if ("[DONE]".equals(line)) break;
 
-            log.info("任务完成：taskId = {}", message.getTaskId());
+                // 解析 line -> deltaText（按 DashScope 规范提取 output.text）
+                String delta = extractDelta(line);
+
+                // 1️⃣ 推送增量
+                redisTemplate.convertAndSend(channel, delta);
+
+                // 2️⃣ 累积
+                full.append(delta);
+            }
+
+            // 发送结束标记
+            redisTemplate.convertAndSend(channel, "[DONE]");
+
+            // 3️⃣ 构建最终 PlanResponse
+            PlanResponse resp = buildResponse(taskId, msg, full.toString());
+            redisTemplate.opsForValue().set(TASK_PREFIX + taskId,
+                    objectMapper.writeValueAsString(resp),
+                    30, TimeUnit.MINUTES);
+
+            log.info("流式任务完成：{}", taskId);
+
         } catch (Exception e) {
-            String failMsg = "生成失败：" + e.getMessage();
-            redisTemplate.opsForValue().set(
-                    TASK_PREFIX + message.getTaskId(),
-                    failMsg,
-                    10, TimeUnit.MINUTES
-            );
-            log.error("调用OpenAI失败", e);
+            redisTemplate.convertAndSend(channel, "[ERROR]");
+            log.error("流式生成失败", e);
         }
     }
 
-    private String generatePlanWithOpenAI(PlanTaskMessage msg) {
-        String prompt = buildPrompt(msg);
-
-        CompletionRequest request = CompletionRequest.builder()
-                .prompt(prompt)
-                .model("text-davinci-003") // 或 gpt-3.5 模型
-                .temperature(0.7)
-                .maxTokens(800)
-                .build();
-
-        return openAiService.createCompletion(request)
-                .getChoices()
-                .get(0)
-                .getText()
-                .trim();
-    }
+//    private String generatePlanWithOpenAI(PlanTaskMessage msg) {
+//        String prompt = buildPrompt(msg);
+//
+//        CompletionRequest request = CompletionRequest.builder()
+//                .prompt(prompt)
+//                .model("text-davinci-003") // 或 gpt-3.5 模型
+//                .temperature(0.7)
+//                .maxTokens(800)
+//                .build();
+//
+//        return openAiService.createCompletion(request)
+//                .getChoices()
+//                .get(0)
+//                .getText()
+//                .trim();
+//    }
 
     private String buildPrompt(PlanTaskMessage msg) {
         String cities = msg.isMultiCityMode() ? String.join("、", msg.getDestinations()) : msg.getDestination();
@@ -110,6 +137,27 @@ public class PlanTaskConsumer {
 
         response.setDayPlans(dayPlans);
         return response;
+    }
+
+    /**
+     * 从 DashScope 流式返回的单行 JSON 中提取增量文本
+     * 行示例：
+     * {"output":{"text":"Day 1: ..."},"usage":{...},"request_id":"xxx"}
+     */
+    private String extractDelta(String line) {
+        try {
+            // 部分平台会在行首加 "data: " 前缀，先去掉
+            if (line.startsWith("data:")) {
+                line = line.substring(5).trim();
+            }
+            JsonNode root = objectMapper.readTree(line);
+            // DashScope 规范：增量文本在 output.text
+            return root.at("/output/text").asText("");
+        } catch (Exception e) {
+            // 解析异常时返回空串，避免中断流
+            log.warn("无法解析 delta 行: {}", line, e);
+            return "";
+        }
     }
 }
     
