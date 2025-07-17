@@ -1,11 +1,18 @@
 package net.eson.component;
 
-import okhttp3.*;
-import okio.BufferedSource;
+import com.alibaba.dashscope.aigc.generation.Generation;
+import com.alibaba.dashscope.aigc.generation.GenerationParam;
+import com.alibaba.dashscope.aigc.generation.GenerationResult;
+import com.alibaba.dashscope.common.Message;
+import com.alibaba.dashscope.exception.ApiException;
+import com.alibaba.dashscope.exception.InputRequiredException;
+import com.alibaba.dashscope.exception.NoApiKeyException;
+import io.reactivex.Flowable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
-
-import java.io.IOException;
-import java.time.Duration;
+import java.util.Arrays;
+import java.util.function.Consumer;
 
 /**
  * @author Eson
@@ -13,49 +20,35 @@ import java.time.Duration;
  */
 @Component
 public class QwenApiClient {
-    private static final String API_KEY = "sk-7e3f22977b25483c9e48d5522a0c127c";
-    private static final String API_URL = "https://dashscope.aliyuncs.com/api/v1/services/aigc/text-generation/generation";
+    private static final Logger logger = LoggerFactory.getLogger(QwenApiClient.class);
 
-    private final OkHttpClient httpClient = new OkHttpClient.Builder()
-            .connectTimeout(Duration.ofSeconds(15))  // 连接超时
-            .writeTimeout(Duration.ofSeconds(15))    // 写请求体超时
-            .readTimeout(Duration.ofSeconds(30))     // 读响应超时
-            .callTimeout(Duration.ofSeconds(35))     // 整个调用超时
-            .retryOnConnectionFailure(true)           // 失败时自动重试
-            .build();
+    private final Generation gen;
 
-    public BufferedSource callQwenStream(String prompt) throws IOException {
-        MediaType jsonType = MediaType.parse("application/json");
-
-        String json = """
-    {
-      "model": "qwen-turbo",
-      "input": {
-        "prompt": "%s"
-      },
-      "parameters": {
-        "temperature": 0.7
-      },
-      "stream": true
+    public QwenApiClient() {
+        this.gen = new Generation();  // 无参构造即可
     }
-    """.formatted(prompt);
 
-        RequestBody body = RequestBody.create(json, jsonType);
-
-        Request request = new Request.Builder()
-                .url(API_URL)
-                .post(body)
-                .addHeader("Authorization", "Bearer " + API_KEY)
-                .addHeader("Content-Type", "application/json")
+    private GenerationParam buildGenerationParam(Message userMsg) {
+        return GenerationParam.builder()
+                .apiKey("sk-7e3f22977b25483c9e48d5522a0c127c")
+                .model("qwen-turbo")   // 或 qwen-plus，根据需要替换
+                .messages(Arrays.asList(userMsg))
+                .resultFormat(GenerationParam.ResultFormat.MESSAGE)
+                .incrementalOutput(true)
                 .build();
-
-        Response response = httpClient.newCall(request).execute();
-        if (!response.isSuccessful() || response.body() == null) {
-            throw new IOException("DashScope error: " + response);
-        }
-        // 返回 Okio Source（记得由调用方关闭）
-        return response.body().source();
     }
 
+
+    /**
+     * 流式调用，带增量回调
+     */
+    public void streamCallWithMessage(Message userMsg, Consumer<String> onDelta)
+            throws NoApiKeyException, ApiException, InputRequiredException {
+        GenerationParam param = buildGenerationParam(userMsg);
+        Flowable<GenerationResult> result = gen.streamCall(param);
+        result.blockingForEach(message -> {
+            String content = message.getOutput().getChoices().get(0).getMessage().getContent();
+            onDelta.accept(content);
+        });
+    }
 }
-    
